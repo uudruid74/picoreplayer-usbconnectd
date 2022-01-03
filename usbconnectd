@@ -1,0 +1,276 @@
+#!/bin/sh
+#
+# This daemon is a helper daemon to bridge squeezelite and udev for more
+# sane handling of USB Audio devices being hotplugged.  On startup, it
+# finds the best USB Audio device and configures squeezelite as well as
+# adding appropriate udev rules to handle that device being unplugged or
+# another device being plugged in.  It then blocks on a FIFO waiting on
+# "add" or "remove" to be sent from udevd down a FIFO which it has created.
+# These commands tell the daemon about the device activity and prompt it
+# to configure a new device, or stop the daemon and possibly configure an
+# existing (older) device.  A blacklist can be used to prevent restart with
+# a device you don't want used.  The blacklist is just card names
+#
+# (c) 2021 by Evan Langlois.  LICENSED under the GNU GPL v3
+#
+
+# Add a few changeable settings
+FIFO="/tmp/usbconnectd.fifo"
+BLACKFILE="/home/tc/usbconnectd.deny"
+UDEVFILE="/etc/udev/rules.d/85-DAC.rules"
+PIDFILE="/var/run/squeezelite.pid"
+PCPCONFIG="/usr/local/etc/pcp/pcp.cfg"
+SOFTKILL=1	#- Reduce how often squeezelite is killed
+
+
+#- NOTE: Change SOFTKILL to 0 if you get restart problems
+#- When set to 1, squeezelite is only killed when output
+#- is changed to another device entirely.
+
+# -=-=-=-=-=-=- Careful editting below this line -=-=-=-=-=-=-
+
+# Utility
+contains() {
+ 	if [ "$1" ] && [ "$2" ] && [ -z "${1##*"$2"*}" ]
+        then  
+		return 0	#- Match
+        else
+		return 1	#- No Match
+        fi
+}
+
+# Return an array of audio device names
+get_card_names() {
+	aplay -L | grep ^sysdefault: | cut -d "=" -f 2
+}
+
+# Given an audio device name, return a USB device id pair
+get_usb_id() {
+	cat /proc/asound/$1/usbid
+}
+
+# Return all the samplerates supported by card
+get_sample_rates() {
+	cat /proc/asound/$1/stream0 | \
+		grep -m 1 Rates | cut -d ":" -f 2 | tr -d ' '
+}
+
+# Get human readable name of the device for debugging, given shortname
+get_readable_dev() {
+	cat /proc/asound/cards | grep \\[$1 | cut -d ":" -f 2
+}
+	
+# Write UDEV rules given current usbid
+create_udev_rules() {
+	idVendor=$(echo $OutputUSB | cut -d ":" -f 1)
+	idProduct=$(echo $OutputUSB | cut -d ":" -f 2)
+
+	# Need to know when THIS device is removed
+
+	echo "SUBSYSTEM==\"sound\", ACTION==\"remove\", \
+ENV{ID_VENDOR_ID}==\"$idVendor\", \
+ENV{ID_MODEL_ID}==\"$idProduct\", \
+RUN+=\"/bin/sh -c '/bin/echo remove >>$FIFO'\"" \
+>$UDEVFILE
+
+	# Or when ANY audio device is added
+
+	echo "SUBSYSTEM==\"sound\", ACTION==\"add\", \
+ENV{ID_TYPE}==\"audio\", ENV{ID_BUS}==\"usb\", \
+ENV{ID_USB_DRIVER}==\"snd-usb-audio\", \
+RUN+=\"/bin/sh -c '/bin/echo add %E{ID_VENDOR_ID}:%E{ID_MODEL_ID} >>$FIFO'\"" \
+>>$UDEVFILE
+
+	sudo udevadm control --reload
+}
+
+# Expand Card short folder name to full alsa string
+get_alsa_name() {
+	aplay -L | grep ^hw:CARD=$1,
+}
+
+# Rewrite PCP Config file
+rewrite_pcp_cfg() {
+	sed -i "s/^OUTPUT=.*\$/OUTPUT=${OUTPUT}/" $PCPCONFIG
+	sed -i "s/^MAX_RATE=.*\$/MAX_RATE=\"${RATES}\"/" $PCPCONFIG
+}
+
+# Get USBID of squeezelite device
+get_current_usbid() {
+	cardName=$(aplay -L | grep ^$OUTPUT | cut -d "=" -f 2 | cut -d "," -f 1)
+	if [ -n "$cardName" ]
+	then
+		echo "Squeezelite will use : $(get_readable_dev $cardName)" >&2
+		get_usb_id $cardName
+	else
+		echo "Invalid OUTPUT device selected" >&2
+	fi
+}
+
+# Find first valid USB device and set it into OUTPUT, USB ID in OutputUSB
+set_failsafe_output() {
+	echo "Existing output device is no longer available"
+	OutputUSB=""
+	for cardName in $(get_card_names)
+	do
+		if $(contains $BLACKLIST $cardName)
+		then
+			continue
+		fi
+		OutputUSB=$(get_usb_id $cardName)
+		OUTPUT=$(get_alsa_name $cardName)
+		RATES=$(get_sample_rates $cardName)
+		echo "New output device is $(get_readable_dev $cardName)"
+		return 0 #- Set to first one found, not last
+	done
+}
+
+# Murders squeezelite to make sure its all gone
+kill_squeezelite() {
+	sudo /usr/local/etc/init.d/squeezelite stop
+	sleep 1
+	killall -HUP squeezelite 2>/dev/null
+	sleep 1
+	killall -KILL squeezelite 2>/dev/null
+	rm $PIDFILE 2>/dev/null
+}
+
+# Stops squeezelite!
+stop_squeezelite() {
+	echo "Stopping squeezelite"
+	if [ "$SOFTKILL" -eq "0" ]
+	then 
+		pcp stop
+		kill_squeezelite
+	else
+		pcp pause
+	fi
+}
+
+# Start up squeezelite
+start_squeezelite() {
+	echo "Starting squeezelite"
+	if [ "$SOFTKILL" -eq "0" ]
+	then
+		sudo /usr/local/etc/init.d/squeezelite start
+	else
+		if [ "$OUTPUT" != "$ORIGOUTPUT" ]
+		then
+			kill_squeezelite
+			sleep 1
+			sudo /usr/local/etc/init.d/squeezelite start
+		fi
+	fi
+	save_failsafe
+	pcp play 
+}
+
+# Run when the current audio device disappears
+device_removed() {
+	set_failsafe_output
+	stop_squeezelite
+	if [ ! -z "$OutputUSB" ]
+	then
+		create_udev_rules
+		rewrite_pcp_cfg
+		start_squeezelite
+	else
+		echo "No Audio Device found"
+	fi
+}
+
+# Finds the alsa device for a given USB ID; sets OUTPUT and OutputUSB
+configure_output() {
+	Target=$1
+	for cardName in $(get_card_names)
+	do
+		if $(contains $BLACKLIST $cardName)
+		then
+			continue
+		fi
+		USBID=$(get_usb_id $cardName)
+		if [ "$USBID" = "$Target" ]
+		then
+			OUTPUT=$(get_alsa_name $cardName)
+			OutputUSB=$USBID
+			RATES=$(get_sample_rates $cardName)
+			echo "New output device is $(get_readable_dev $cardName)"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Restore Failsafes and set when squeezelite starts
+restore_failsafe() {
+	OUTPUT=$ORIGOUTPUT
+	OutputUSB=$OrigUSB
+}
+save_failsafe() {
+	ORIGOUTPUT=$OUTPUT
+	OrigUSB=$OutputUSB
+}
+
+# Run when a new USB Audio device is found
+new_device() {
+	OutputUSB=$2
+	configure_output $OutputUSB
+	if [ "$?" -ne 0 ]
+	then
+		echo "USB Device not supported"
+		restore_failsafe
+	else
+		echo "New USB Output Detected"
+		stop_squeezelite
+		create_udev_rules 
+		rewrite_pcp_cfg
+		start_squeezelite
+	fi
+}
+
+# Basic Startup and Initialization
+echo "Starting usbconnectd"
+
+rm -f $FIFO >/dev/null
+mkfifo $FIFO
+
+# Read the PCP.CFG into local variables
+. $PCPCONFIG
+
+# Get the USBID of the configured output
+OutputUSB=$(get_current_usbid)
+
+# Read the blacklist
+BLACKLIST=$(cat $BLACKFILE 2>/dev/null)
+
+# Hope squeezelite and pcp.cfg are in sync
+save_failsafe
+
+if [ -z "$OutputUSB" ]
+then
+	device_removed
+fi
+
+create_udev_rules 
+
+while true
+do
+	if read input <$FIFO
+	then
+		if [ $(expr length "$input") -lt "6" ]
+		then
+			continue
+		fi
+		command=$(echo $input | cut -d ' ' -f 1)
+		case $command in
+		add)
+			new_device $input
+			;;
+		remove)
+			device_removed
+			;;
+		esac
+
+	fi
+done
+
